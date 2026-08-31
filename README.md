@@ -28,7 +28,29 @@ It is deliberately minimal. No multi-tenant auth, no dashboards, no full connect
 | `list_checkpoints` | List incomplete / recent work |
 | `mark_done` | Mark a work item complete |
 
-Optional meta fields on checkpoints can hold a Horos `receipt_hash` or Mneme memory key for later composition.
+Optional `meta` on checkpoints can hold a Horos `receipt_hash` or Mneme memory key.
+
+### `check_usage` — header path
+
+Preferred: pass the **raw provider response headers** plus `platform`:
+
+```json
+{
+  "platform": "openai",
+  "estimated_tokens": 5000,
+  "headers": {
+    "x-ratelimit-remaining-tokens": "42000",
+    "x-ratelimit-remaining-requests": "8"
+  }
+}
+```
+
+ATG parses OpenAI / Anthropic header names (case-insensitive). You may also pass `remaining_tokens` / `remaining_requests` directly if the host already extracted them.
+
+Policy:
+- **pause** — remaining < estimate, or requests ≤ 1
+- **budget_low** — remaining < 1000, or remaining < estimate / `low_threshold` (default 0.2)
+- **proceed** — otherwise, or when no limit data is supplied
 
 ---
 
@@ -37,33 +59,62 @@ Optional meta fields on checkpoints can hold a Horos `receipt_hash` or Mneme mem
 ```bash
 git clone https://github.com/holeyfield33-art/ATG.git
 cd ATG
-python -m venv .venv && source .venv/bin/activate   # or Windows equivalent
-pip install -r requirements.txt
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 
-# Run over stdio (default for most MCP hosts)
+# stdio (recommended for MCP hosts)
 python -m atg
 
-# Or streamable HTTP
-python -m atg --transport streamable-http --port 8765
+# streamable-HTTP is UNAUTHENTICATED — local-only
+# requires explicit opt-in:
+python -m atg --transport streamable-http --port 8765 --allow-remote-http
 ```
 
-Point your MCP host (Claude Code, Cursor, custom agent, etc.) at the server.
+### Security: streamable-HTTP
+
+**streamable-HTTP has no authentication.** It is intended for local development only. The server refuses to start HTTP mode unless you pass `--allow-remote-http` or set `ATG_ALLOW_REMOTE_HTTP=1`. Prefer **stdio** for real hosts.
+
+---
+
+## Configuration
+
+| Env | Meaning |
+|-----|---------|
+| `ATG_DB_PATH` | SQLite path (default `~/.atg/checkpoints.db`) |
+| `ATG_INTEGRITY_KEY` | Optional HMAC-SHA256 key for checkpoint integrity |
+| `ATG_ALLOW_REMOTE_HTTP` | Set to `1` to allow unauthenticated HTTP transport |
+
+JSON fields (`data`, `meta`, `token_snapshot`) are capped at ~512 KB. Store large blobs externally and pass a URI.
+
+SQLite uses **WAL** + `busy_timeout`. Old versions per `work_id` are pruned (keep last 20).
+
+---
+
+## Example agent loop
+
+See [`examples/agent_loop.py`](examples/agent_loop.py): extract headers → `check_usage` policy → checkpoint on pause → resume.
+
+```bash
+python examples/agent_loop.py
+```
+
+---
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
 
 ---
 
 ## Design principles
 
-- **Side-car, not platform.** Compose with Horos and Mneme via MCP; do not re-implement them.
-- **Headers first.** Prefer live rate-limit headers. Admin API usage is optional and only used when the key is present.
-- **SQLite by default.** Single-file, zero ops for personal / consulting use.
-- **Stable tool schemas.** Clear names so hosts can call them reliably.
-- **Loose integration seams.** Checkpoint `meta` can reference Horos receipts or Mneme keys without tight coupling.
-
----
-
-## Status
-
-Early / vibe-coding. Core tools + SQLite checkpoint store. OpenAI + Anthropic header awareness planned first.
+- **Side-car, not platform.** Compose with Horos and Mneme via MCP.
+- **Headers first.** Prefer live rate-limit headers over Admin APIs.
+- **SQLite by default.** Zero ops for personal / consulting use.
+- **Loose integration seams.** Checkpoint `meta` can reference Horos / Mneme IDs.
 
 ---
 

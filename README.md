@@ -1,5 +1,10 @@
 # Aletheia Token Guard (ATG)
 
+[![CI](https://github.com/holeyfield33-art/ATG/actions/workflows/ci.yml/badge.svg)](https://github.com/holeyfield33-art/ATG/actions/workflows/ci.yml)
+[![Vibe Check Code Scanner](https://img.shields.io/badge/Vibe%20Check-Code%20Scanner-purple?logo=github)](https://github.com/marketplace/actions/vibe-check-code-scanner)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+
 **Slim MCP server for token/usage awareness and durable work checkpoints.**
 
 Plugin-ready companion to [Horos](https://github.com/holeyfield33-art/Horos) (context router + signed receipts) and [Mneme](https://github.com/holeyfield33-art/Mneme-) (persistent memory).

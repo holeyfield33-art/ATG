@@ -4,75 +4,22 @@ from __future__ import annotations
 
 from typing import Any
 
-
-def decide_action(
-    remaining_tokens: int | None = None,
-    remaining_requests: int | None = None,
-    estimated_tokens: int = 0,
-    low_threshold: float = 0.2,
-) -> dict[str, Any]:
-    """
-    Return a simple proceed / budget_low / pause signal.
-
-    This deliberately does not pretend to know exact remaining budget.
-    Prefer live rate-limit headers when available.
-    """
-    if remaining_tokens is None and remaining_requests is None:
-        return {
-            "action": "proceed",
-            "reason": "no_limit_data",
-            "remaining_tokens": None,
-            "remaining_requests": None,
-            "estimated_tokens": estimated_tokens,
-        }
-
-    # Hard pause if we clearly cannot afford the estimate
-    if remaining_tokens is not None and estimated_tokens > 0:
-        if remaining_tokens < estimated_tokens:
-            return {
-                "action": "pause",
-                "reason": "insufficient_tokens_for_estimate",
-                "remaining_tokens": remaining_tokens,
-                "remaining_requests": remaining_requests,
-                "estimated_tokens": estimated_tokens,
-            }
-
-        # Soft warning
-        if remaining_tokens < estimated_tokens * (1 / max(low_threshold, 0.01)):
-            # e.g. if estimate is 5k and threshold 0.2, warn below 25k
-            pass
-
-    if remaining_requests is not None and remaining_requests <= 1:
-        return {
-            "action": "pause",
-            "reason": "requests_nearly_exhausted",
-            "remaining_tokens": remaining_tokens,
-            "remaining_requests": remaining_requests,
-            "estimated_tokens": estimated_tokens,
-        }
-
-    if remaining_tokens is not None and remaining_tokens < 1000:
-        return {
-            "action": "budget_low",
-            "reason": "tokens_low",
-            "remaining_tokens": remaining_tokens,
-            "remaining_requests": remaining_requests,
-            "estimated_tokens": estimated_tokens,
-        }
-
-    return {
-        "action": "proceed",
-        "reason": "ok",
-        "remaining_tokens": remaining_tokens,
-        "remaining_requests": remaining_requests,
-        "estimated_tokens": estimated_tokens,
-    }
+# Soft-low multiplier: if remaining < estimated / low_threshold, surface budget_low.
+# e.g. threshold 0.2 and estimate 5000 → warn when remaining < 25000.
+DEFAULT_LOW_THRESHOLD = 0.2
+ABSOLUTE_TOKEN_FLOOR = 1000
 
 
 def parse_openai_headers(headers: dict[str, str]) -> dict[str, int | None]:
     """Extract useful rate-limit fields from OpenAI response headers."""
+
     def _int(key: str) -> int | None:
-        val = headers.get(key) or headers.get(key.lower())
+        val = headers.get(key)
+        if val is None:
+            for k, v in headers.items():
+                if k.lower() == key.lower():
+                    val = v
+                    break
         if val is None:
             return None
         try:
@@ -90,12 +37,17 @@ def parse_openai_headers(headers: dict[str, str]) -> dict[str, int | None]:
 
 def parse_anthropic_headers(headers: dict[str, str]) -> dict[str, int | None]:
     """Extract useful rate-limit fields from Anthropic response headers."""
+
     def _int(key: str) -> int | None:
-        val = headers.get(key) or headers.get(key.lower())
+        val = headers.get(key)
+        if val is None:
+            for k, v in headers.items():
+                if k.lower() == key.lower():
+                    val = v
+                    break
         if val is None:
             return None
         try:
-            # Anthropic sometimes rounds remaining tokens
             return int(float(val))
         except (TypeError, ValueError):
             return None
@@ -105,4 +57,93 @@ def parse_anthropic_headers(headers: dict[str, str]) -> dict[str, int | None]:
         "remaining_requests": _int("anthropic-ratelimit-requests-remaining"),
         "limit_tokens": _int("anthropic-ratelimit-tokens-limit"),
         "limit_requests": _int("anthropic-ratelimit-requests-limit"),
+    }
+
+
+def parse_headers(platform: str, headers: dict[str, str]) -> dict[str, int | None]:
+    """Dispatch to the correct header parser for the platform."""
+    platform = (platform or "").lower().strip()
+    if platform in ("openai", "azure", "azure_openai"):
+        return parse_openai_headers(headers)
+    if platform in ("anthropic", "claude"):
+        return parse_anthropic_headers(headers)
+    oa = parse_openai_headers(headers)
+    an = parse_anthropic_headers(headers)
+    return {
+        "remaining_tokens": oa["remaining_tokens"] if oa["remaining_tokens"] is not None else an["remaining_tokens"],
+        "remaining_requests": oa["remaining_requests"] if oa["remaining_requests"] is not None else an["remaining_requests"],
+        "limit_tokens": oa["limit_tokens"] if oa["limit_tokens"] is not None else an["limit_tokens"],
+        "limit_requests": oa["limit_requests"] if oa["limit_requests"] is not None else an["limit_requests"],
+    }
+
+
+def decide_action(
+    remaining_tokens: int | None = None,
+    remaining_requests: int | None = None,
+    estimated_tokens: int = 0,
+    low_threshold: float = DEFAULT_LOW_THRESHOLD,
+) -> dict[str, Any]:
+    """
+    Return a simple proceed / budget_low / pause signal.
+
+    Soft threshold: when remaining_tokens < estimated_tokens / low_threshold
+    (and still above the hard estimate), return budget_low so the agent can
+    checkpoint early.
+    """
+    if remaining_tokens is None and remaining_requests is None:
+        return {
+            "action": "proceed",
+            "reason": "no_limit_data",
+            "remaining_tokens": None,
+            "remaining_requests": None,
+            "estimated_tokens": estimated_tokens,
+        }
+
+    if remaining_tokens is not None and estimated_tokens > 0:
+        if remaining_tokens < estimated_tokens:
+            return {
+                "action": "pause",
+                "reason": "insufficient_tokens_for_estimate",
+                "remaining_tokens": remaining_tokens,
+                "remaining_requests": remaining_requests,
+                "estimated_tokens": estimated_tokens,
+            }
+
+    if remaining_requests is not None and remaining_requests <= 1:
+        return {
+            "action": "pause",
+            "reason": "requests_nearly_exhausted",
+            "remaining_tokens": remaining_tokens,
+            "remaining_requests": remaining_requests,
+            "estimated_tokens": estimated_tokens,
+        }
+
+    if remaining_tokens is not None and remaining_tokens < ABSOLUTE_TOKEN_FLOOR:
+        return {
+            "action": "budget_low",
+            "reason": "tokens_low",
+            "remaining_tokens": remaining_tokens,
+            "remaining_requests": remaining_requests,
+            "estimated_tokens": estimated_tokens,
+        }
+
+    if remaining_tokens is not None and estimated_tokens > 0:
+        thresh = max(float(low_threshold), 0.01)
+        soft_limit = estimated_tokens / thresh
+        if remaining_tokens < soft_limit:
+            return {
+                "action": "budget_low",
+                "reason": "soft_threshold",
+                "remaining_tokens": remaining_tokens,
+                "remaining_requests": remaining_requests,
+                "estimated_tokens": estimated_tokens,
+                "soft_limit": int(soft_limit),
+            }
+
+    return {
+        "action": "proceed",
+        "reason": "ok",
+        "remaining_tokens": remaining_tokens,
+        "remaining_requests": remaining_requests,
+        "estimated_tokens": estimated_tokens,
     }

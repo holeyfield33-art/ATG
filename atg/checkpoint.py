@@ -2,28 +2,66 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_DB = Path.home() / ".atg" / "checkpoints.db"
+MAX_JSON_BYTES = 512_000  # ~512 KB per JSON field
+DEFAULT_PRUNE_KEEP = 20  # keep last N versions per work_id (including superseded)
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _resolve_db_path(db_path: Path | str | None) -> Path:
+    if db_path is not None:
+        return Path(db_path)
+    env = os.environ.get("ATG_DB_PATH")
+    if env:
+        return Path(env)
+    return DEFAULT_DB
+
+
+def _json_dumps_limited(obj: Any, field_name: str) -> str:
+    raw = json.dumps(obj, separators=(",", ":"), default=str)
+    if len(raw.encode("utf-8")) > MAX_JSON_BYTES:
+        raise ValueError(
+            f"{field_name} exceeds max size of {MAX_JSON_BYTES} bytes; "
+            "store large blobs externally and pass a URI/handle instead"
+        )
+    return raw
+
+
 class CheckpointStore:
-    def __init__(self, db_path: Path | str | None = None) -> None:
-        self.db_path = Path(db_path) if db_path else DEFAULT_DB
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        integrity_key: str | bytes | None = None,
+        prune_keep: int = DEFAULT_PRUNE_KEEP,
+    ) -> None:
+        self.db_path = _resolve_db_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.prune_keep = max(1, prune_keep)
+        key = integrity_key if integrity_key is not None else os.environ.get("ATG_INTEGRITY_KEY")
+        self._integrity_key: bytes | None = (
+            key.encode("utf-8") if isinstance(key, str) else key
+        )
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _init_db(self) -> None:
@@ -38,11 +76,16 @@ class CheckpointStore:
                     data TEXT NOT NULL,
                     meta TEXT,
                     token_snapshot TEXT,
+                    integrity TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            # migrate older DBs that lack integrity column
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(checkpoints)").fetchall()}
+            if "integrity" not in cols:
+                conn.execute("ALTER TABLE checkpoints ADD COLUMN integrity TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_checkpoints_work_id ON checkpoints(work_id)"
             )
@@ -50,6 +93,23 @@ class CheckpointStore:
                 "CREATE INDEX IF NOT EXISTS idx_checkpoints_status ON checkpoints(status)"
             )
             conn.commit()
+
+    def _sign(self, work_id: str, data_json: str, created_at: str) -> str | None:
+        if not self._integrity_key:
+            return None
+        msg = f"{work_id}|{created_at}|{data_json}".encode("utf-8")
+        return hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
+
+    def _verify_row(self, row: sqlite3.Row) -> bool | None:
+        """Return True/False if key configured, else None (not checked)."""
+        if not self._integrity_key:
+            return None
+        expected = row["integrity"]
+        if not expected:
+            return False
+        msg = f"{row['work_id']}|{row['created_at']}|{row['data']}".encode("utf-8")
+        actual = hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(actual, expected)
 
     def save(
         self,
@@ -59,31 +119,47 @@ class CheckpointStore:
         meta: dict[str, Any] | None = None,
         token_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not work_id or not str(work_id).strip():
+            raise ValueError("work_id is required")
+        if data is None:
+            raise ValueError("data is required")
+
         now = _utc_now()
+        data_json = _json_dumps_limited(data, "data")
+        meta_json = _json_dumps_limited(meta, "meta") if meta is not None else None
+        token_json = (
+            _json_dumps_limited(token_snapshot, "token_snapshot")
+            if token_snapshot is not None
+            else None
+        )
+        integrity = self._sign(work_id, data_json, now)
+
         with self._connect() as conn:
-            # Keep only one active row per work_id for simplicity (latest wins)
             conn.execute(
-                "UPDATE checkpoints SET status = 'superseded', updated_at = ? WHERE work_id = ? AND status = 'in_progress'",
+                "UPDATE checkpoints SET status = 'superseded', updated_at = ? "
+                "WHERE work_id = ? AND status = 'in_progress'",
                 (now, work_id),
             )
             cur = conn.execute(
                 """
                 INSERT INTO checkpoints
-                    (work_id, platform, status, data, meta, token_snapshot, created_at, updated_at)
-                VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?)
+                    (work_id, platform, status, data, meta, token_snapshot, integrity, created_at, updated_at)
+                VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     work_id,
                     platform,
-                    json.dumps(data),
-                    json.dumps(meta) if meta is not None else None,
-                    json.dumps(token_snapshot) if token_snapshot is not None else None,
+                    data_json,
+                    meta_json,
+                    token_json,
+                    integrity,
                     now,
                     now,
                 ),
             )
-            conn.commit()
             checkpoint_id = cur.lastrowid
+            self._prune(conn, work_id)
+            conn.commit()
 
         return {
             "id": checkpoint_id,
@@ -91,7 +167,19 @@ class CheckpointStore:
             "platform": platform,
             "status": "in_progress",
             "created_at": now,
+            "integrity": bool(integrity),
         }
+
+    def _prune(self, conn: sqlite3.Connection, work_id: str) -> None:
+        """Keep only the newest prune_keep rows for this work_id."""
+        rows = conn.execute(
+            "SELECT id FROM checkpoints WHERE work_id = ? ORDER BY id DESC",
+            (work_id,),
+        ).fetchall()
+        if len(rows) <= self.prune_keep:
+            return
+        drop_ids = [r["id"] for r in rows[self.prune_keep :]]
+        conn.executemany("DELETE FROM checkpoints WHERE id = ?", [(i,) for i in drop_ids])
 
     def load(self, work_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -107,6 +195,7 @@ class CheckpointStore:
         if not row:
             return None
 
+        verified = self._verify_row(row)
         return {
             "id": row["id"],
             "work_id": row["work_id"],
@@ -117,9 +206,12 @@ class CheckpointStore:
             "token_snapshot": json.loads(row["token_snapshot"]) if row["token_snapshot"] else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "integrity_ok": verified,
         }
 
-    def list_incomplete(self, platform: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def list_incomplete(
+        self, platform: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
         query = """
             SELECT work_id, platform, MAX(updated_at) AS last_updated, COUNT(*) AS versions
             FROM checkpoints
@@ -149,7 +241,8 @@ class CheckpointStore:
         now = _utc_now()
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE checkpoints SET status = 'done', updated_at = ? WHERE work_id = ? AND status = 'in_progress'",
+                "UPDATE checkpoints SET status = 'done', updated_at = ? "
+                "WHERE work_id = ? AND status = 'in_progress'",
                 (now, work_id),
             )
             conn.commit()

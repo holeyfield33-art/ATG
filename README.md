@@ -4,11 +4,13 @@
 
 Plugin-ready companion to [Horos](https://github.com/holeyfield33-art/Horos) (context router + signed receipts) and [Mneme](https://github.com/holeyfield33-art/Mneme-) (persistent memory).
 
+**Status:** experimental v0.1 — single-user local sidecar. See [SECURITY.md](SECURITY.md).
+
 ---
 
 ## Why ATG?
 
-Agents die mid-task when they hit rate limits, spend caps, or context budgets. ATG gives any MCP host a thin, reliable side-car that:
+Agents die mid-task when they hit rate limits, spend caps, or context budgets. ATG gives any MCP host a thin side-car that:
 
 1. Answers **"can I keep going?"** (rate-limit headers + simple policy)
 2. Lets the agent **save a checkpoint** and resume later
@@ -25,7 +27,7 @@ It is deliberately minimal. No multi-tenant auth, no dashboards, no full connect
 | `check_usage` | Rate-limit / budget signal. Returns `proceed` / `budget_low` / `pause` |
 | `save_checkpoint` | Persist work progress under a `work_id` |
 | `load_checkpoint` | Retrieve the latest checkpoint for a `work_id` |
-| `list_checkpoints` | List incomplete / recent work |
+| `list_checkpoints` | List incomplete / recent work (limit clamped 1–500) |
 | `mark_done` | Mark a work item complete |
 
 Optional `meta` on checkpoints can hold a Horos `receipt_hash` or Mneme memory key.
@@ -47,7 +49,10 @@ Preferred: pass the **raw provider response headers** plus `platform`:
 
 ATG parses OpenAI / Anthropic header names (case-insensitive). You may also pass `remaining_tokens` / `remaining_requests` directly if the host already extracted them.
 
+**ATG does not intercept provider traffic.** The host/agent must supply headers or remaining counts. Policy is advisory.
+
 Policy:
+
 - **pause** — remaining < estimate, or requests ≤ 1
 - **budget_low** — remaining < 1000, or remaining < estimate / `low_threshold` (default 0.2)
 - **proceed** — otherwise, or when no limit data is supplied
@@ -74,6 +79,8 @@ python -m atg --transport streamable-http --port 8765 --allow-remote-http
 
 **streamable-HTTP has no authentication.** It is intended for local development only. The server refuses to start HTTP mode unless you pass `--allow-remote-http` or set `ATG_ALLOW_REMOTE_HTTP=1`. Prefer **stdio** for real hosts.
 
+Full notes: [SECURITY.md](SECURITY.md).
+
 ---
 
 ## Configuration
@@ -81,12 +88,14 @@ python -m atg --transport streamable-http --port 8765 --allow-remote-http
 | Env | Meaning |
 |-----|---------|
 | `ATG_DB_PATH` | SQLite path (default `~/.atg/checkpoints.db`) |
-| `ATG_INTEGRITY_KEY` | Optional HMAC-SHA256 key for checkpoint integrity |
+| `ATG_INTEGRITY_KEY` | Optional HMAC-SHA256 key (covers work_id, status, data, meta, token_snapshot, created_at) |
 | `ATG_ALLOW_REMOTE_HTTP` | Set to `1` to allow unauthenticated HTTP transport |
 
 JSON fields (`data`, `meta`, `token_snapshot`) are capped at ~512 KB. Store large blobs externally and pass a URI.
 
-SQLite uses **WAL** + `busy_timeout`. Old versions per `work_id` are pruned (keep last 20).
+`work_id` max 256 chars; charset `[A-Za-z0-9._:/-]`.
+
+SQLite uses **WAL** + `busy_timeout` with short connect retries on cold start. Old versions per `work_id` are pruned (keep last 20).
 
 ---
 
@@ -115,6 +124,7 @@ pytest -q
 - **Headers first.** Prefer live rate-limit headers over Admin APIs.
 - **SQLite by default.** Zero ops for personal / consulting use.
 - **Loose integration seams.** Checkpoint `meta` can reference Horos / Mneme IDs.
+- **Honest limits.** Single-user, local, no encryption at rest, advisory policy only.
 
 ---
 

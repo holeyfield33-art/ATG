@@ -94,9 +94,14 @@ def list_checkpoints(
     platform: str | None = None,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """List incomplete work items."""
-    items = store.list_incomplete(platform=platform, limit=limit)
-    return {"count": len(items), "items": items}
+    """List incomplete work items (limit clamped to 1–500)."""
+    try:
+        limit_i = int(limit)
+    except (TypeError, ValueError):
+        limit_i = 50
+    limit_i = max(1, min(limit_i, 500))
+    items = store.list_incomplete(platform=platform, limit=limit_i)
+    return {"count": len(items), "items": items, "limit": limit_i}
 
 
 @mcp.tool()

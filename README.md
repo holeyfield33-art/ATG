@@ -100,7 +100,7 @@ JSON fields (`data`, `meta`, `token_snapshot`) are capped at ~512 KB. Store larg
 
 `work_id` max 256 chars; charset `[A-Za-z0-9._:/-]`.
 
-SQLite uses **WAL** + `busy_timeout` with short connect retries on cold start. Old versions per `work_id` are pruned (keep last 20).
+SQLite uses **WAL** + `busy_timeout=5000` for lock contention, and `_connect()` separately retries (up to 3 attempts, exponential backoff starting at 50ms) on a `sqlite3.OperationalError` raised before a connection is established — e.g. transient contention creating the db file/directory on cold start. Old versions per `work_id` are pruned (keep last 20).
 
 ---
 

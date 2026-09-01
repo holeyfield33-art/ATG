@@ -6,7 +6,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,9 @@ from typing import Any
 DEFAULT_DB = Path.home() / ".atg" / "checkpoints.db"
 MAX_JSON_BYTES = 512_000  # ~512 KB per JSON field
 DEFAULT_PRUNE_KEEP = 20  # keep last N versions per work_id (including superseded)
+WORK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
+DEFAULT_CONNECT_RETRIES = 3
+DEFAULT_CONNECT_RETRY_BACKOFF = 0.05  # seconds; doubles each retry
 
 
 def _utc_now() -> str:
@@ -30,7 +35,10 @@ def _resolve_db_path(db_path: Path | str | None) -> Path:
 
 
 def _json_dumps_limited(obj: Any, field_name: str) -> str:
-    raw = json.dumps(obj, separators=(",", ":"), default=str)
+    try:
+        raw = json.dumps(obj, separators=(",", ":"))
+    except TypeError as exc:
+        raise ValueError(f"{field_name} contains a non-JSON-serializable value: {exc}") from exc
     if len(raw.encode("utf-8")) > MAX_JSON_BYTES:
         raise ValueError(
             f"{field_name} exceeds max size of {MAX_JSON_BYTES} bytes; "
@@ -46,10 +54,14 @@ class CheckpointStore:
         *,
         integrity_key: str | bytes | None = None,
         prune_keep: int = DEFAULT_PRUNE_KEEP,
+        connect_retries: int = DEFAULT_CONNECT_RETRIES,
+        connect_retry_backoff: float = DEFAULT_CONNECT_RETRY_BACKOFF,
     ) -> None:
         self.db_path = _resolve_db_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.prune_keep = max(1, prune_keep)
+        self._connect_retries = max(0, connect_retries)
+        self._connect_retry_backoff = connect_retry_backoff
         key = integrity_key if integrity_key is not None else os.environ.get("ATG_INTEGRITY_KEY")
         self._integrity_key: bytes | None = (
             key.encode("utf-8") if isinstance(key, str) else key
@@ -57,12 +69,22 @@ class CheckpointStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        """Open a connection, retrying transient OperationalErrors (e.g. cold-start
+        contention creating the db file/directory) with exponential backoff."""
+        attempt = 0
+        while True:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA foreign_keys=ON")
+                return conn
+            except sqlite3.OperationalError:
+                if attempt >= self._connect_retries:
+                    raise
+                time.sleep(self._connect_retry_backoff * (2**attempt))
+                attempt += 1
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -94,10 +116,38 @@ class CheckpointStore:
             )
             conn.commit()
 
-    def _sign(self, work_id: str, data_json: str, created_at: str) -> str | None:
+    @staticmethod
+    def _sign_message(
+        work_id: str,
+        status: str,
+        created_at: str,
+        data_json: str,
+        meta_json: str | None,
+        token_json: str | None,
+    ) -> bytes:
+        # Each field is length-prefixed (and tagged N for None) so no combination
+        # of field contents can shift a byte across a field boundary.
+        parts: list[bytes] = []
+        for value in (work_id, status, created_at, data_json, meta_json, token_json):
+            if value is None:
+                parts.append(b"N")
+            else:
+                encoded = value.encode("utf-8")
+                parts.append(b"S" + str(len(encoded)).encode("ascii") + b":" + encoded)
+        return b"|".join(parts)
+
+    def _sign(
+        self,
+        work_id: str,
+        status: str,
+        created_at: str,
+        data_json: str,
+        meta_json: str | None,
+        token_json: str | None,
+    ) -> str | None:
         if not self._integrity_key:
             return None
-        msg = f"{work_id}|{created_at}|{data_json}".encode("utf-8")
+        msg = self._sign_message(work_id, status, created_at, data_json, meta_json, token_json)
         return hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
 
     def _verify_row(self, row: sqlite3.Row) -> bool | None:
@@ -107,7 +157,14 @@ class CheckpointStore:
         expected = row["integrity"]
         if not expected:
             return False
-        msg = f"{row['work_id']}|{row['created_at']}|{row['data']}".encode("utf-8")
+        msg = self._sign_message(
+            row["work_id"],
+            row["status"],
+            row["created_at"],
+            row["data"],
+            row["meta"],
+            row["token_snapshot"],
+        )
         actual = hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
         return hmac.compare_digest(actual, expected)
 
@@ -121,6 +178,12 @@ class CheckpointStore:
     ) -> dict[str, Any]:
         if not work_id or not str(work_id).strip():
             raise ValueError("work_id is required")
+        if len(work_id) > 256:
+            raise ValueError(f"work_id must be 1-256 characters (got {len(work_id)})")
+        if not WORK_ID_RE.fullmatch(work_id):
+            raise ValueError(
+                "work_id contains disallowed characters; only [A-Za-z0-9._:/-] are permitted"
+            )
         if data is None:
             raise ValueError("data is required")
 
@@ -132,7 +195,7 @@ class CheckpointStore:
             if token_snapshot is not None
             else None
         )
-        integrity = self._sign(work_id, data_json, now)
+        integrity = self._sign(work_id, "in_progress", now, data_json, meta_json, token_json)
 
         with self._connect() as conn:
             conn.execute(

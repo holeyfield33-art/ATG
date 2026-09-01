@@ -56,9 +56,35 @@ def test_size_limit(store: CheckpointStore):
         store.save("w1", huge)
 
 
+def test_non_serializable_data_raises(store: CheckpointStore):
+    class Unserializable:
+        pass
+
+    with pytest.raises(ValueError, match="non-JSON-serializable"):
+        store.save("w1", {"nested": Unserializable()})
+
+
 def test_missing_work_id(store: CheckpointStore):
     with pytest.raises(ValueError):
         store.save("", {"a": 1})
+
+
+def test_work_id_too_long(store: CheckpointStore):
+    with pytest.raises(ValueError, match="1-256 characters"):
+        store.save("a" * 257, {"a": 1})
+
+
+def test_work_id_disallowed_characters(store: CheckpointStore):
+    for bad in ("has space", "line\nbreak", "null\x00byte", "emoji✅"):
+        with pytest.raises(ValueError, match="disallowed characters"):
+            store.save(bad, {"a": 1})
+
+
+def test_work_id_boundary_256_allowed_chars(store: CheckpointStore):
+    work_id = ("a" * 253) + "._-"  # exactly 256 chars, all in the allowed charset
+    assert len(work_id) == 256
+    result = store.save(work_id, {"a": 1})
+    assert result["work_id"] == work_id
 
 
 def test_concurrent_saves(tmp_path: Path):
@@ -94,6 +120,60 @@ def test_integrity_detects_tamper(tmp_path: Path):
     assert loaded["integrity_ok"] is False
 
 
+def test_integrity_detects_meta_tamper(tmp_path: Path):
+    db = tmp_path / "i2.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True}, meta={"receipt": "abc"})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE checkpoints SET meta = ? WHERE work_id = ?", ('{"receipt": "tampered"}', "w1")
+    )
+    conn.commit()
+    conn.close()
+
+    loaded = s.load("w1")
+    assert loaded is not None
+    assert loaded["integrity_ok"] is False
+
+
+def test_integrity_detects_token_snapshot_tamper(tmp_path: Path):
+    db = tmp_path / "i3.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True}, token_snapshot={"remaining": 100})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE checkpoints SET token_snapshot = ? WHERE work_id = ?",
+        ('{"remaining": 999999}', "w1"),
+    )
+    conn.commit()
+    conn.close()
+
+    loaded = s.load("w1")
+    assert loaded is not None
+    assert loaded["integrity_ok"] is False
+
+
+def test_integrity_detects_status_tamper(tmp_path: Path):
+    db = tmp_path / "i4.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE checkpoints SET status = ? WHERE work_id = ?", ("done", "w1"))
+    conn.commit()
+    conn.close()
+
+    with sqlite3.connect(db) as conn2:
+        conn2.row_factory = sqlite3.Row
+        row = conn2.execute("SELECT * FROM checkpoints WHERE work_id = ?", ("w1",)).fetchone()
+    assert s._verify_row(row) is False
+
+
 def test_env_db_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     path = tmp_path / "env.db"
     monkeypatch.setenv("ATG_DB_PATH", str(path))
@@ -101,3 +181,47 @@ def test_env_db_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert s.db_path == path
     s.save("w", {"a": 1})
     assert path.exists()
+
+
+def test_connect_retries_transient_operational_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "retry.db",
+        connect_retries=3,
+        connect_retry_backoff=0.001,
+    )
+    real_connect = sqlite3.connect
+    calls = {"n": 0}
+
+    def flaky_connect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", flaky_connect)
+    conn = s._connect()
+    conn.close()
+    assert calls["n"] == 3
+
+
+def test_connect_gives_up_after_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "retry2.db",
+        connect_retries=2,
+        connect_retry_backoff=0.001,
+    )
+
+    def always_fails(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sqlite3, "connect", always_fails)
+    with pytest.raises(sqlite3.OperationalError):
+        s._connect()

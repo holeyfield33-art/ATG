@@ -189,7 +189,8 @@ with tempfile.TemporaryDirectory() as td:
     conn = sqlite3.connect(db)
     conn.execute("UPDATE checkpoints SET meta = ? WHERE work_id = ?",
                  ('{"receipt_hash": "FORGED"}', "job1"))
-    conn.commit(); conn.close()
+    conn.execute("UPDATE checkpoints SET token_snapshot = ? WHERE work_id = ?",
+                 ('{"remaining_tokens": 1}', "job1"))
     print("tamper detected:", s.load("job1")["integrity_ok"] is False)  # expect True
 
     # 2. Oversized / malformed work_id

@@ -94,10 +94,38 @@ class CheckpointStore:
             )
             conn.commit()
 
-    def _sign(self, work_id: str, data_json: str, created_at: str) -> str | None:
+    @staticmethod
+    def _sign_message(
+        work_id: str,
+        status: str,
+        created_at: str,
+        data_json: str,
+        meta_json: str | None,
+        token_json: str | None,
+    ) -> bytes:
+        # Each field is length-prefixed (and tagged N for None) so no combination
+        # of field contents can shift a byte across a field boundary.
+        parts: list[bytes] = []
+        for value in (work_id, status, created_at, data_json, meta_json, token_json):
+            if value is None:
+                parts.append(b"N")
+            else:
+                encoded = value.encode("utf-8")
+                parts.append(b"S" + str(len(encoded)).encode("ascii") + b":" + encoded)
+        return b"|".join(parts)
+
+    def _sign(
+        self,
+        work_id: str,
+        status: str,
+        created_at: str,
+        data_json: str,
+        meta_json: str | None,
+        token_json: str | None,
+    ) -> str | None:
         if not self._integrity_key:
             return None
-        msg = f"{work_id}|{created_at}|{data_json}".encode("utf-8")
+        msg = self._sign_message(work_id, status, created_at, data_json, meta_json, token_json)
         return hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
 
     def _verify_row(self, row: sqlite3.Row) -> bool | None:
@@ -107,7 +135,14 @@ class CheckpointStore:
         expected = row["integrity"]
         if not expected:
             return False
-        msg = f"{row['work_id']}|{row['created_at']}|{row['data']}".encode("utf-8")
+        msg = self._sign_message(
+            row["work_id"],
+            row["status"],
+            row["created_at"],
+            row["data"],
+            row["meta"],
+            row["token_snapshot"],
+        )
         actual = hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
         return hmac.compare_digest(actual, expected)
 
@@ -132,7 +167,7 @@ class CheckpointStore:
             if token_snapshot is not None
             else None
         )
-        integrity = self._sign(work_id, data_json, now)
+        integrity = self._sign(work_id, "in_progress", now, data_json, meta_json, token_json)
 
         with self._connect() as conn:
             conn.execute(

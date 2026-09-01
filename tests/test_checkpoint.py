@@ -94,6 +94,60 @@ def test_integrity_detects_tamper(tmp_path: Path):
     assert loaded["integrity_ok"] is False
 
 
+def test_integrity_detects_meta_tamper(tmp_path: Path):
+    db = tmp_path / "i2.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True}, meta={"receipt": "abc"})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE checkpoints SET meta = ? WHERE work_id = ?", ('{"receipt": "tampered"}', "w1")
+    )
+    conn.commit()
+    conn.close()
+
+    loaded = s.load("w1")
+    assert loaded is not None
+    assert loaded["integrity_ok"] is False
+
+
+def test_integrity_detects_token_snapshot_tamper(tmp_path: Path):
+    db = tmp_path / "i3.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True}, token_snapshot={"remaining": 100})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE checkpoints SET token_snapshot = ? WHERE work_id = ?",
+        ('{"remaining": 999999}', "w1"),
+    )
+    conn.commit()
+    conn.close()
+
+    loaded = s.load("w1")
+    assert loaded is not None
+    assert loaded["integrity_ok"] is False
+
+
+def test_integrity_detects_status_tamper(tmp_path: Path):
+    db = tmp_path / "i4.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True})
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE checkpoints SET status = ? WHERE work_id = ?", ("done", "w1"))
+    conn.commit()
+    conn.close()
+
+    with sqlite3.connect(db) as conn2:
+        conn2.row_factory = sqlite3.Row
+        row = conn2.execute("SELECT * FROM checkpoints WHERE work_id = ?", ("w1",)).fetchone()
+    assert s._verify_row(row) is False
+
+
 def test_env_db_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     path = tmp_path / "env.db"
     monkeypatch.setenv("ATG_DB_PATH", str(path))

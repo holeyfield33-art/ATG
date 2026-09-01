@@ -31,6 +31,7 @@ Preferred `check_usage` path: pass raw provider `headers` + `platform` (`openai`
 - **stdio** preferred for real MCP hosts.
 - **streamable-http** is unauthenticated; requires `--allow-remote-http` or `ATG_ALLOW_REMOTE_HTTP=1`; local-dev only.
 - Optional `ATG_INTEGRITY_KEY` HMAC covers `work_id`, `status`, `created_at`, `data`, `meta`, `token_snapshot` (detection, not encryption).
+- **Breaking:** the HMAC message format changed to actually cover all six fields listed above (it previously covered only `work_id`, `created_at`, `data`). Checkpoints signed before this change will report `integrity_ok: false` under the new scheme — this is expected, not corruption. Re-save checkpoints you need to keep verifying.
 - No encryption at rest. Default DB: `~/.atg/checkpoints.db` (`ATG_DB_PATH` to override).
 - `work_id` max 256 chars; charset `[A-Za-z0-9._:/-]`.
 - JSON fields capped ~512 KB.

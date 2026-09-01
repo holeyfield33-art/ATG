@@ -34,7 +34,7 @@ jobs:
 
       - name: Vibe Check Code Scanner
         id: vibe
-        uses: holeyfield33-art/vibe-check@v1.1.1
+        uses: holeyfield33-art/vibe-check@v1.1.2
         with:
           path: .
           fail-on: hard

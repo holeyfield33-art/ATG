@@ -181,3 +181,47 @@ def test_env_db_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert s.db_path == path
     s.save("w", {"a": 1})
     assert path.exists()
+
+
+def test_connect_retries_transient_operational_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "retry.db",
+        connect_retries=3,
+        connect_retry_backoff=0.001,
+    )
+    real_connect = sqlite3.connect
+    calls = {"n": 0}
+
+    def flaky_connect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", flaky_connect)
+    conn = s._connect()
+    conn.close()
+    assert calls["n"] == 3
+
+
+def test_connect_gives_up_after_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "retry2.db",
+        connect_retries=2,
+        connect_retry_backoff=0.001,
+    )
+
+    def always_fails(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sqlite3, "connect", always_fails)
+    with pytest.raises(sqlite3.OperationalError):
+        s._connect()

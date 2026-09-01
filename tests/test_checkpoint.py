@@ -56,6 +56,14 @@ def test_size_limit(store: CheckpointStore):
         store.save("w1", huge)
 
 
+def test_non_serializable_data_raises(store: CheckpointStore):
+    class Unserializable:
+        pass
+
+    with pytest.raises(ValueError, match="non-JSON-serializable"):
+        store.save("w1", {"nested": Unserializable()})
+
+
 def test_missing_work_id(store: CheckpointStore):
     with pytest.raises(ValueError):
         store.save("", {"a": 1})

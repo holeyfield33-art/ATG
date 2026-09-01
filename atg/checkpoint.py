@@ -32,7 +32,10 @@ def _resolve_db_path(db_path: Path | str | None) -> Path:
 
 
 def _json_dumps_limited(obj: Any, field_name: str) -> str:
-    raw = json.dumps(obj, separators=(",", ":"), default=str)
+    try:
+        raw = json.dumps(obj, separators=(",", ":"))
+    except TypeError as exc:
+        raise ValueError(f"{field_name} contains a non-JSON-serializable value: {exc}") from exc
     if len(raw.encode("utf-8")) > MAX_JSON_BYTES:
         raise ValueError(
             f"{field_name} exceeds max size of {MAX_JSON_BYTES} bytes; "

@@ -114,12 +114,115 @@ python examples/agent_loop.py
 
 ---
 
-## Tests
+## Local development & testing (Codespaces)
+
+Everything below runs the same way in a GitHub Codespace as it does anywhere else —
+no extra setup beyond what's already in this repo.
+
+### 1. Get the code and a clean environment
 
 ```bash
+git clone https://github.com/holeyfield33-art/ATG.git
+cd ATG
+python -m venv .venv
+source .venv/bin/activate        # every new terminal/session needs this re-run
 pip install -e ".[dev]"
+```
+`pip install -e .` is an "editable" install — it links the package to this
+checkout instead of copying it, so edits to `atg/*.py` take effect immediately
+without reinstalling.
+
+### 2. Run the automated test suite
+
+```bash
 pytest -q
 ```
+Expect `29 passed`. `-q` just means quiet output (dots instead of a line per test);
+drop it (`pytest`) if you want to see each test name as it runs.
+
+To run one file or one test while you're iterating:
+```bash
+pytest tests/test_checkpoint.py -v          # one file, verbose
+pytest tests/test_checkpoint.py -k tamper   # only tests with "tamper" in the name
+```
+
+### 3. Run the server by hand (stdio)
+
+```bash
+python -m atg
+```
+This starts the MCP server on stdio and blocks, waiting for an MCP client to talk
+to it over stdin/stdout — it won't print anything on its own. `Ctrl+C` to stop.
+This is how a real MCP host (Claude Desktop, an agent framework, etc.) would run it;
+there's nothing to click or browse to.
+
+### 4. Run the worked example
+
+```bash
+python examples/agent_loop.py
+```
+This exercises the whole flow in-process — no MCP host needed — so it's the
+fastest way to see `check_usage` → `save_checkpoint` → `load_checkpoint` actually
+working end to end. Read `examples/agent_loop.py` alongside the output; it's short
+and it's the clearest map of how the pieces fit together.
+
+### 5. Verify the security fixes yourself
+
+If you want to see the properties SECURITY.md claims actually hold — rather than
+take the docs' word for it — drop this into a scratch file and run it. It tries
+the exact three attacks that were open before this round of fixes and confirms
+each is now blocked:
+
+```python
+# scratch_verify.py — safe to delete after running
+import sqlite3, tempfile
+from pathlib import Path
+from atg.checkpoint import CheckpointStore
+
+with tempfile.TemporaryDirectory() as td:
+    db = Path(td) / "verify.db"
+    s = CheckpointStore(db_path=db, integrity_key="test-key")
+    s.save("job1", {"step": 1}, meta={"receipt_hash": "abc123"},
+           token_snapshot={"remaining_tokens": 90000})
+
+    # 1. Tamper with meta/token_snapshot directly in the DB file, bypassing the API
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE checkpoints SET meta = ? WHERE work_id = ?",
+                 ('{"receipt_hash": "FORGED"}', "job1"))
+    conn.commit(); conn.close()
+    print("tamper detected:", s.load("job1")["integrity_ok"] is False)  # expect True
+
+    # 2. Oversized / malformed work_id
+    try:
+        s.save("x" * 5000, {"a": 1})
+        print("work_id validation: FAILED (accepted bad input)")
+    except ValueError:
+        print("work_id validation: OK (rejected)")
+
+    # 3. Non-JSON-serializable data
+    class Weird:
+        pass
+    try:
+        s.save("w2", {"bad": Weird()})
+        print("serialization check: FAILED (silently accepted)")
+    except ValueError:
+        print("serialization check: OK (rejected)")
+```
+```bash
+python scratch_verify.py
+```
+All three lines should say the guarantee held. If any of them don't, that's a
+regression worth opening an issue over before it ships.
+
+### 6. Sanity-check a fresh dependency install
+
+Because `mcp[cli]` is a range (`>=1.0.0,<3.0.0`), not a single pinned version, it's
+worth occasionally confirming what actually gets installed matches what's tested:
+```bash
+pip show mcp | grep Version   # should currently print 2.1.1
+```
+If this ever prints something outside the tested range, don't trust the security
+posture claims until the test suite has been re-run against that version.
 
 ---
 

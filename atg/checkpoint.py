@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 DEFAULT_DB = Path.home() / ".atg" / "checkpoints.db"
 MAX_JSON_BYTES = 512_000  # ~512 KB per JSON field
 DEFAULT_PRUNE_KEEP = 20  # keep last N versions per work_id (including superseded)
+WORK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
 
 
 def _utc_now() -> str:
@@ -156,6 +158,12 @@ class CheckpointStore:
     ) -> dict[str, Any]:
         if not work_id or not str(work_id).strip():
             raise ValueError("work_id is required")
+        if len(work_id) > 256:
+            raise ValueError(f"work_id must be 1-256 characters (got {len(work_id)})")
+        if not WORK_ID_RE.fullmatch(work_id):
+            raise ValueError(
+                "work_id contains disallowed characters; only [A-Za-z0-9._:/-] are permitted"
+            )
         if data is None:
             raise ValueError("data is required")
 

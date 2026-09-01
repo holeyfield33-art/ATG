@@ -61,6 +61,24 @@ def test_missing_work_id(store: CheckpointStore):
         store.save("", {"a": 1})
 
 
+def test_work_id_too_long(store: CheckpointStore):
+    with pytest.raises(ValueError, match="1-256 characters"):
+        store.save("a" * 257, {"a": 1})
+
+
+def test_work_id_disallowed_characters(store: CheckpointStore):
+    for bad in ("has space", "line\nbreak", "null\x00byte", "emoji✅"):
+        with pytest.raises(ValueError, match="disallowed characters"):
+            store.save(bad, {"a": 1})
+
+
+def test_work_id_boundary_256_allowed_chars(store: CheckpointStore):
+    work_id = ("a" * 253) + "._-"  # exactly 256 chars, all in the allowed charset
+    assert len(work_id) == 256
+    result = store.save(work_id, {"a": 1})
+    assert result["work_id"] == work_id
+
+
 def test_concurrent_saves(tmp_path: Path):
     db = tmp_path / "c.db"
 

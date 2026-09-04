@@ -27,6 +27,29 @@ def test_absolute_token_floor():
     assert d["reason"] == "tokens_low"
 
 
+def test_pause_on_exhausted_tokens_without_estimate():
+    # Regression: previously a 0-remaining budget with no estimated_tokens
+    # (the default) fell through to the advisory-only "budget_low" and never
+    # hit a hard "pause".
+    d = decide_action(remaining_tokens=0, estimated_tokens=0)
+    assert d["action"] == "pause"
+    assert d["reason"] == "tokens_exhausted"
+
+
+def test_pause_on_negative_remaining_tokens_without_estimate():
+    d = decide_action(remaining_tokens=-5, estimated_tokens=0)
+    assert d["action"] == "pause"
+    assert d["reason"] == "tokens_exhausted"
+
+
+def test_pause_via_estimate_still_takes_priority_reason():
+    # When an estimate is supplied and remaining is fully exhausted, the more
+    # specific "insufficient_tokens_for_estimate" reason still wins.
+    d = decide_action(remaining_tokens=0, estimated_tokens=100)
+    assert d["action"] == "pause"
+    assert d["reason"] == "insufficient_tokens_for_estimate"
+
+
 def test_soft_threshold():
     # estimate 5000, threshold 0.2 → soft_limit 25000
     d = decide_action(remaining_tokens=10_000, estimated_tokens=5_000, low_threshold=0.2)
@@ -78,3 +101,17 @@ def test_parse_headers_dispatch():
     h2 = {"anthropic-ratelimit-tokens-remaining": "11"}
     p2 = parse_headers("anthropic", h2)
     assert p2["remaining_tokens"] == 11
+
+
+def test_parse_headers_unset_platform_merges_both_parsers():
+    # Regression: an unset/None platform must not silently behave like
+    # "openai" and drop real Anthropic headers.
+    h = {"anthropic-ratelimit-tokens-remaining": "7"}
+    p = parse_headers(None, h)
+    assert p["remaining_tokens"] == 7
+
+
+def test_parse_headers_empty_string_platform_merges_both_parsers():
+    h = {"x-ratelimit-remaining-tokens": "13"}
+    p = parse_headers("", h)
+    assert p["remaining_tokens"] == 13

@@ -60,8 +60,14 @@ def parse_anthropic_headers(headers: dict[str, str]) -> dict[str, int | None]:
     }
 
 
-def parse_headers(platform: str, headers: dict[str, str]) -> dict[str, int | None]:
-    """Dispatch to the correct header parser for the platform."""
+def parse_headers(platform: str | None, headers: dict[str, str]) -> dict[str, int | None]:
+    """Dispatch to the correct header parser for the platform.
+
+    An unset/unrecognized platform merges both parsers rather than guessing —
+    guessing OpenAI for headers that are actually Anthropic's (or vice versa)
+    would silently return all-None and let decide_action report a false
+    "proceed" on an exhausted budget.
+    """
     platform = (platform or "").lower().strip()
     if platform in ("openai", "azure", "azure_openai"):
         return parse_openai_headers(headers)
@@ -108,6 +114,18 @@ def decide_action(
                 "remaining_requests": remaining_requests,
                 "estimated_tokens": estimated_tokens,
             }
+
+    # Hard stop on a truly exhausted token budget even when the caller didn't
+    # supply estimated_tokens — without this, a 0-budget caller that omits the
+    # estimate only ever gets the advisory "budget_low", never "pause".
+    if remaining_tokens is not None and remaining_tokens <= 0:
+        return {
+            "action": "pause",
+            "reason": "tokens_exhausted",
+            "remaining_tokens": remaining_tokens,
+            "remaining_requests": remaining_requests,
+            "estimated_tokens": estimated_tokens,
+        }
 
     if remaining_requests is not None and remaining_requests <= 1:
         return {

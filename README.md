@@ -54,11 +54,13 @@ Preferred: pass the **raw provider response headers** plus `platform`:
 
 ATG parses OpenAI / Anthropic header names (case-insensitive). You may also pass `remaining_tokens` / `remaining_requests` directly if the host already extracted them.
 
+Pass the real `platform` name when you pass `headers`. `platform` has no default — if you omit it (or pass something ATG doesn't recognize), ATG merges both the OpenAI and Anthropic parsers rather than guessing OpenAI, so real Anthropic headers are never silently misread as "no limit data" and turned into a false `proceed`.
+
 **ATG does not intercept provider traffic.** The host/agent must supply headers or remaining counts. Policy is advisory.
 
 Policy:
 
-- **pause** — remaining < estimate, or requests ≤ 1
+- **pause** — remaining tokens ≤ 0, remaining < estimate, or requests ≤ 1
 - **budget_low** — remaining < 1000, or remaining < estimate / `low_threshold` (default 0.2)
 - **proceed** — otherwise, or when no limit data is supplied
 
@@ -76,8 +78,12 @@ pip install -e ".[dev]"
 python -m atg
 
 # streamable-HTTP is UNAUTHENTICATED — local-only
-# requires explicit opt-in:
+# requires explicit opt-in; binds to 127.0.0.1 by default:
 python -m atg --transport streamable-http --port 8765 --allow-remote-http
+
+# to actually expose it beyond this machine, pass --host explicitly too
+# (still requires --allow-remote-http):
+python -m atg --transport streamable-http --port 8765 --host 0.0.0.0 --allow-remote-http
 ```
 
 ### Security: streamable-HTTP
@@ -93,7 +99,7 @@ Full notes: [SECURITY.md](SECURITY.md).
 | Env | Meaning |
 |-----|---------|
 | `ATG_DB_PATH` | SQLite path (default `~/.atg/checkpoints.db`) |
-| `ATG_INTEGRITY_KEY` | Optional HMAC-SHA256 key (covers work_id, status, data, meta, token_snapshot, created_at) |
+| `ATG_INTEGRITY_KEY` | Optional HMAC-SHA256 key (covers work_id, platform, status, data, meta, token_snapshot, created_at) |
 | `ATG_ALLOW_REMOTE_HTTP` | Set to `1` to allow unauthenticated HTTP transport |
 
 JSON fields (`data`, `meta`, `token_snapshot`) are capped at ~512 KB. Store large blobs externally and pass a URI.
@@ -137,7 +143,7 @@ without reinstalling.
 ```bash
 pytest -q
 ```
-Expect `29 passed`. `-q` just means quiet output (dots instead of a line per test);
+Expect `44 passed`. `-q` just means quiet output (dots instead of a line per test);
 drop it (`pytest`) if you want to see each test name as it runs.
 
 To run one file or one test while you're iterating:

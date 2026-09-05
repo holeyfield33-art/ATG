@@ -143,7 +143,7 @@ without reinstalling.
 ```bash
 pytest -q
 ```
-Expect `44 passed`. `-q` just means quiet output (dots instead of a line per test);
+Expect `46 passed`. `-q` just means quiet output (dots instead of a line per test);
 drop it (`pytest`) if you want to see each test name as it runs.
 
 To run one file or one test while you're iterating:

@@ -250,11 +250,19 @@ class _FlakyConnProxy:
     and can't be monkeypatched directly, so we proxy a real connection
     instead of patching the class."""
 
-    def __init__(self, real_conn, fail_sql_prefix: str, fail_times: int, calls: dict):
+    def __init__(
+        self,
+        real_conn,
+        fail_sql_prefix: str,
+        fail_times: int,
+        calls: dict,
+        message: str = "database is locked",
+    ):
         self._real = real_conn
         self._fail_sql_prefix = fail_sql_prefix
         self._fail_times = fail_times
         self._calls = calls
+        self._message = message
 
     def execute(self, sql, *args, **kwargs):
         import sqlite3
@@ -262,7 +270,7 @@ class _FlakyConnProxy:
         if sql.strip().startswith(self._fail_sql_prefix):
             self._calls["n"] += 1
             if self._calls["n"] <= self._fail_times:
-                raise sqlite3.OperationalError("database is locked")
+                raise sqlite3.OperationalError(self._message)
         return self._real.execute(sql, *args, **kwargs)
 
     def __enter__(self):
@@ -280,13 +288,14 @@ def _patch_flaky_connect(
     store: CheckpointStore,
     fail_sql_prefix: str,
     fail_times: int,
+    message: str = "database is locked",
 ) -> dict:
     real_connect = store._connect
     calls = {"n": 0}
     monkeypatch.setattr(
         store,
         "_connect",
-        lambda: _FlakyConnProxy(real_connect(), fail_sql_prefix, fail_times, calls),
+        lambda: _FlakyConnProxy(real_connect(), fail_sql_prefix, fail_times, calls, message),
     )
     return calls
 
@@ -346,3 +355,28 @@ def test_mark_done_retries_on_write_contention(
     )
     assert s.mark_done("w1") is True
     assert calls["n"] == 2
+
+
+def test_save_does_not_retry_non_lock_operational_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Regression: _run_with_retry must only retry lock/busy contention.
+    A non-transient OperationalError (schema issue, I/O error, ...) should
+    surface immediately instead of being hidden behind retry backoff."""
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "write_retry4.db",
+        connect_retries=3,
+        connect_retry_backoff=0.001,
+    )
+    calls = _patch_flaky_connect(
+        monkeypatch,
+        s,
+        "UPDATE checkpoints SET status = 'superseded'",
+        fail_times=1_000_000,
+        message="no such table: checkpoints",
+    )
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        s.save("w1", {"x": 1})
+    assert calls["n"] == 1  # failed once, no retries attempted

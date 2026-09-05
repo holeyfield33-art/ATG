@@ -11,7 +11,9 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+T = TypeVar("T")
 
 DEFAULT_DB = Path.home() / ".atg" / "checkpoints.db"
 MAX_JSON_BYTES = 512_000  # ~512 KB per JSON field
@@ -86,6 +88,29 @@ class CheckpointStore:
                 time.sleep(self._connect_retry_backoff * (2**attempt))
                 attempt += 1
 
+    def _run_with_retry(self, body: Callable[[sqlite3.Connection], T]) -> T:
+        """Run body(conn) under a fresh connection, retrying the whole
+        connect+write+commit sequence on a transient OperationalError with
+        exponential backoff.
+
+        PRAGMA busy_timeout already covers most lock contention during the
+        write itself, but if a write is still blocked when that timeout
+        expires, sqlite3 raises OperationalError from execute()/commit() —
+        not from connect(). _connect()'s own retry loop only covers errors
+        raised by connect() and the PRAGMA setup, so without this wrapper
+        that error would propagate unhandled out of save()/mark_done().
+        """
+        attempt = 0
+        while True:
+            try:
+                with self._connect() as conn:
+                    return body(conn)
+            except sqlite3.OperationalError:
+                if attempt >= self._connect_retries:
+                    raise
+                time.sleep(self._connect_retry_backoff * (2**attempt))
+                attempt += 1
+
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -119,6 +144,7 @@ class CheckpointStore:
     @staticmethod
     def _sign_message(
         work_id: str,
+        platform: str | None,
         status: str,
         created_at: str,
         data_json: str,
@@ -128,7 +154,7 @@ class CheckpointStore:
         # Each field is length-prefixed (and tagged N for None) so no combination
         # of field contents can shift a byte across a field boundary.
         parts: list[bytes] = []
-        for value in (work_id, status, created_at, data_json, meta_json, token_json):
+        for value in (work_id, platform, status, created_at, data_json, meta_json, token_json):
             if value is None:
                 parts.append(b"N")
             else:
@@ -139,6 +165,7 @@ class CheckpointStore:
     def _sign(
         self,
         work_id: str,
+        platform: str | None,
         status: str,
         created_at: str,
         data_json: str,
@@ -147,7 +174,9 @@ class CheckpointStore:
     ) -> str | None:
         if not self._integrity_key:
             return None
-        msg = self._sign_message(work_id, status, created_at, data_json, meta_json, token_json)
+        msg = self._sign_message(
+            work_id, platform, status, created_at, data_json, meta_json, token_json
+        )
         return hmac.new(self._integrity_key, msg, hashlib.sha256).hexdigest()
 
     def _verify_row(self, row: sqlite3.Row) -> bool | None:
@@ -159,6 +188,7 @@ class CheckpointStore:
             return False
         msg = self._sign_message(
             row["work_id"],
+            row["platform"],
             row["status"],
             row["created_at"],
             row["data"],
@@ -195,9 +225,11 @@ class CheckpointStore:
             if token_snapshot is not None
             else None
         )
-        integrity = self._sign(work_id, "in_progress", now, data_json, meta_json, token_json)
+        integrity = self._sign(
+            work_id, platform, "in_progress", now, data_json, meta_json, token_json
+        )
 
-        with self._connect() as conn:
+        def _do(conn: sqlite3.Connection) -> int:
             conn.execute(
                 "UPDATE checkpoints SET status = 'superseded', updated_at = ? "
                 "WHERE work_id = ? AND status = 'in_progress'",
@@ -220,9 +252,12 @@ class CheckpointStore:
                     now,
                 ),
             )
-            checkpoint_id = cur.lastrowid
+            new_id = cur.lastrowid
             self._prune(conn, work_id)
             conn.commit()
+            return new_id
+
+        checkpoint_id = self._run_with_retry(_do)
 
         return {
             "id": checkpoint_id,
@@ -302,7 +337,8 @@ class CheckpointStore:
 
     def mark_done(self, work_id: str) -> bool:
         now = _utc_now()
-        with self._connect() as conn:
+
+        def _do(conn: sqlite3.Connection) -> bool:
             cur = conn.execute(
                 "UPDATE checkpoints SET status = 'done', updated_at = ? "
                 "WHERE work_id = ? AND status = 'in_progress'",
@@ -310,3 +346,5 @@ class CheckpointStore:
             )
             conn.commit()
             return cur.rowcount > 0
+
+        return self._run_with_retry(_do)

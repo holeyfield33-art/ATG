@@ -18,7 +18,7 @@ store = CheckpointStore()
 
 @mcp.tool()
 def check_usage(
-    platform: str = "openai",
+    platform: str | None = None,
     estimated_tokens: int = 0,
     remaining_tokens: int | None = None,
     remaining_requests: int | None = None,
@@ -31,6 +31,12 @@ def check_usage(
     Preferred path: pass the raw provider response `headers` dict and the
     platform name; ATG will parse rate-limit fields. Alternatively pass
     remaining_tokens / remaining_requests explicitly (host-extracted).
+
+    `platform` should name the actual provider ("openai" or "anthropic") when
+    `headers` is supplied — an omitted/unrecognized platform merges both
+    parsers instead of guessing OpenAI, so real Anthropic headers are never
+    silently misread as "no limit data" (which would report a false proceed
+    on an exhausted budget).
 
     If neither headers nor remaining_* are provided, returns a neutral
     proceed signal so agents do not block.
@@ -123,6 +129,15 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=8765, help="Port for streamable-http")
     parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Bind host for streamable-http (default: 127.0.0.1, loopback-only). "
+            "Pass a non-loopback address (e.g. 0.0.0.0) to actually expose the "
+            "server beyond this machine — still requires --allow-remote-http."
+        ),
+    )
+    parser.add_argument(
         "--allow-remote-http",
         action="store_true",
         help="Override the local-only guard for streamable-http (INSECURE)",
@@ -142,16 +157,19 @@ def main() -> None:
             "Prefer stdio for production hosts."
         )
         print(msg, file=sys.stderr)
-        # Still allow bind to localhost only via explicit override path documentation
         warnings.warn(msg, stacklevel=1)
         # Enforce: require the flag
         raise SystemExit(2)
 
     print(
-        "WARNING: streamable-http has no authentication. Bind only on trusted networks.",
+        f"WARNING: streamable-http has no authentication. Binding to "
+        f"{args.host}:{args.port}. Bind only on trusted networks.",
         file=sys.stderr,
     )
-    mcp.run(transport="streamable-http", port=args.port)
+    # Pin the bind host explicitly rather than relying on the mcp SDK's own
+    # default, so ATG's local-only posture doesn't depend on an unpinned
+    # upstream default across the mcp>=1.0.0,<3.0.0 range.
+    mcp.run(transport="streamable-http", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

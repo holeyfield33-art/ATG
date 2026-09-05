@@ -157,6 +157,22 @@ def test_integrity_detects_token_snapshot_tamper(tmp_path: Path):
     assert loaded["integrity_ok"] is False
 
 
+def test_integrity_detects_platform_tamper(tmp_path: Path):
+    db = tmp_path / "i5.db"
+    s = CheckpointStore(db_path=db, integrity_key="secret")
+    s.save("w1", {"ok": True}, platform="openai")
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE checkpoints SET platform = ? WHERE work_id = ?", ("anthropic", "w1"))
+    conn.commit()
+    conn.close()
+
+    loaded = s.load("w1")
+    assert loaded is not None
+    assert loaded["integrity_ok"] is False
+
+
 def test_integrity_detects_status_tamper(tmp_path: Path):
     db = tmp_path / "i4.db"
     s = CheckpointStore(db_path=db, integrity_key="secret")
@@ -225,3 +241,108 @@ def test_connect_gives_up_after_retries_exhausted(
     monkeypatch.setattr(sqlite3, "connect", always_fails)
     with pytest.raises(sqlite3.OperationalError):
         s._connect()
+
+
+class _FlakyConnProxy:
+    """Wraps a real sqlite3.Connection so `execute()` calls matching
+    `fail_sql_prefix` raise sqlite3.OperationalError the first `fail_times`
+    times they're seen, then pass through. sqlite3.Connection is a C type
+    and can't be monkeypatched directly, so we proxy a real connection
+    instead of patching the class."""
+
+    def __init__(self, real_conn, fail_sql_prefix: str, fail_times: int, calls: dict):
+        self._real = real_conn
+        self._fail_sql_prefix = fail_sql_prefix
+        self._fail_times = fail_times
+        self._calls = calls
+
+    def execute(self, sql, *args, **kwargs):
+        import sqlite3
+
+        if sql.strip().startswith(self._fail_sql_prefix):
+            self._calls["n"] += 1
+            if self._calls["n"] <= self._fail_times:
+                raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._real.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _patch_flaky_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    store: CheckpointStore,
+    fail_sql_prefix: str,
+    fail_times: int,
+) -> dict:
+    real_connect = store._connect
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: _FlakyConnProxy(real_connect(), fail_sql_prefix, fail_times, calls),
+    )
+    return calls
+
+
+def test_save_retries_on_write_contention(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Regression: lock contention surfacing during the write itself (after
+    PRAGMA busy_timeout expires), not just at connect() time, must be
+    retried too instead of propagating unhandled out of save()."""
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "write_retry.db",
+        connect_retries=3,
+        connect_retry_backoff=0.001,
+    )
+    calls = _patch_flaky_connect(
+        monkeypatch, s, "UPDATE checkpoints SET status = 'superseded'", fail_times=2
+    )
+    result = s.save("w1", {"x": 1})
+    assert result["work_id"] == "w1"
+    assert calls["n"] == 3
+    assert s.load("w1")["data"]["x"] == 1
+
+
+def test_save_gives_up_after_write_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import sqlite3
+
+    s = CheckpointStore(
+        db_path=tmp_path / "write_retry2.db",
+        connect_retries=2,
+        connect_retry_backoff=0.001,
+    )
+    _patch_flaky_connect(
+        monkeypatch,
+        s,
+        "UPDATE checkpoints SET status = 'superseded'",
+        fail_times=1_000_000,
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        s.save("w1", {"x": 1})
+
+
+def test_mark_done_retries_on_write_contention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    s = CheckpointStore(
+        db_path=tmp_path / "write_retry3.db",
+        connect_retries=3,
+        connect_retry_backoff=0.001,
+    )
+    s.save("w1", {"x": 1})
+
+    calls = _patch_flaky_connect(
+        monkeypatch, s, "UPDATE checkpoints SET status = 'done'", fail_times=1
+    )
+    assert s.mark_done("w1") is True
+    assert calls["n"] == 2

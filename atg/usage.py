@@ -66,9 +66,11 @@ def parse_headers(platform: str | None, headers: dict[str, str]) -> dict[str, in
     An unset/unrecognized platform merges both parsers rather than guessing —
     guessing OpenAI for headers that are actually Anthropic's (or vice versa)
     would silently return all-None and let decide_action report a false
-    "proceed" on an exhausted budget.
+    "proceed" on an exhausted budget. A non-string platform (a caller passing
+    a stray int/dict through a loosely-typed MCP call) is treated the same as
+    unset rather than raising, for the same reason.
     """
-    platform = (platform or "").lower().strip()
+    platform = platform.lower().strip() if isinstance(platform, str) else ""
     if platform in ("openai", "azure", "azure_openai"):
         return parse_openai_headers(headers)
     if platform in ("anthropic", "claude"):

@@ -115,3 +115,11 @@ def test_parse_headers_empty_string_platform_merges_both_parsers():
     h = {"x-ratelimit-remaining-tokens": "13"}
     p = parse_headers("", h)
     assert p["remaining_tokens"] == 13
+
+
+def test_parse_headers_non_string_platform_treated_as_unset():
+    # Regression: a non-string platform (e.g. a stray int/dict from a
+    # loosely-typed caller) must not crash .lower() — treat it as unset.
+    h = {"x-ratelimit-remaining-tokens": "5"}
+    p = parse_headers(123, h)  # type: ignore[arg-type]
+    assert p["remaining_tokens"] == 5

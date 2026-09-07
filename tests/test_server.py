@@ -6,8 +6,11 @@ from pathlib import Path
 
 # atg.server builds a module-level CheckpointStore() on import; point it at a
 # throwaway DB instead of the real ~/.atg/checkpoints.db before importing.
+# Force the override (not setdefault) — a dev's shell may already export
+# ATG_DB_PATH pointing at their real local checkpoints DB, and running the
+# test suite must never write there.
 _TEST_DB_DIR = tempfile.mkdtemp(prefix="atg-server-test-")
-os.environ.setdefault("ATG_DB_PATH", str(Path(_TEST_DB_DIR) / "test-server.db"))
+os.environ["ATG_DB_PATH"] = str(Path(_TEST_DB_DIR) / "test-server.db")
 
 import pytest  # noqa: E402
 

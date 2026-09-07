@@ -70,9 +70,26 @@ class CheckpointStore:
         )
         self._init_db()
 
+    @staticmethod
+    def _is_lock_contention_error(exc: sqlite3.OperationalError) -> bool:
+        """True for SQLite's transient lock/busy errors, which are safe to
+        retry. Other OperationalErrors (missing table, malformed DB, I/O
+        errors, permission denied, ...) are not transient and must not be
+        hidden behind a retry loop."""
+        msg = str(exc).lower()
+        return "locked" in msg or "busy" in msg
+
     def _connect(self) -> sqlite3.Connection:
         """Open a connection, retrying transient OperationalErrors (e.g. cold-start
-        contention creating the db file/directory) with exponential backoff."""
+        contention creating the db file/directory) with exponential backoff.
+
+        Unlike _run_with_retry, this deliberately retries *any*
+        OperationalError raised while establishing the connection — cold-start
+        directory/file creation races can surface as "unable to open database
+        file" rather than a lock/busy message, and this loop only ever wraps
+        connect()/PRAGMA setup, never a write, so there's nothing here for a
+        broad retry to mask.
+        """
         attempt = 0
         while True:
             try:
@@ -99,14 +116,19 @@ class CheckpointStore:
         not from connect(). _connect()'s own retry loop only covers errors
         raised by connect() and the PRAGMA setup, so without this wrapper
         that error would propagate unhandled out of save()/mark_done().
+
+        Only retries lock/busy contention (see _is_lock_contention_error) —
+        this wraps an actual write, so a non-transient OperationalError
+        (e.g. a schema or I/O error) must surface immediately rather than
+        being hidden behind repeated retries.
         """
         attempt = 0
         while True:
             try:
                 with self._connect() as conn:
                     return body(conn)
-            except sqlite3.OperationalError:
-                if attempt >= self._connect_retries:
+            except sqlite3.OperationalError as exc:
+                if attempt >= self._connect_retries or not self._is_lock_contention_error(exc):
                     raise
                 time.sleep(self._connect_retry_backoff * (2**attempt))
                 attempt += 1

@@ -197,6 +197,8 @@ with tempfile.TemporaryDirectory() as td:
                  ('{"receipt_hash": "FORGED"}', "job1"))
     conn.execute("UPDATE checkpoints SET token_snapshot = ? WHERE work_id = ?",
                  ('{"remaining_tokens": 1}', "job1"))
+    conn.commit()
+    conn.close()
     print("tamper detected:", s.load("job1")["integrity_ok"] is False)  # expect True
 
     # 2. Oversized / malformed work_id

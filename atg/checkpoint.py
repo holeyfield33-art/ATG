@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -125,7 +126,7 @@ class CheckpointStore:
         attempt = 0
         while True:
             try:
-                with self._connect() as conn:
+                with contextlib.closing(self._connect()) as conn, conn:
                     return body(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= self._connect_retries or not self._is_lock_contention_error(exc):
@@ -134,7 +135,7 @@ class CheckpointStore:
                 attempt += 1
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -302,7 +303,7 @@ class CheckpointStore:
         conn.executemany("DELETE FROM checkpoints WHERE id = ?", [(i,) for i in drop_ids])
 
     def load(self, work_id: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             row = conn.execute(
                 """
                 SELECT * FROM checkpoints
@@ -344,7 +345,7 @@ class CheckpointStore:
         query += " GROUP BY work_id, platform ORDER BY last_updated DESC LIMIT ?"
         params.append(limit)
 
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn, conn:
             rows = conn.execute(query, params).fetchall()
 
         return [

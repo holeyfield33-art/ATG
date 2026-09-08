@@ -380,3 +380,37 @@ def test_save_does_not_retry_non_lock_operational_errors(
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         s.save("w1", {"x": 1})
     assert calls["n"] == 1  # failed once, no retries attempted
+
+
+def test_connections_are_closed_after_every_operation(store: CheckpointStore):
+    """Regression: _connect() opened a fresh sqlite3.Connection per call, and
+    every call site used `with self._connect() as conn:` — but Connection's
+    own context manager only commits/rolls back on exit, it never closes the
+    connection. That leaked one open handle per operation for the life of
+    the process. Harmless on POSIX (you can unlink an open file there), but
+    on Windows a leaked handle keeps the db file locked: deleting or moving
+    it (e.g. tempfile.TemporaryDirectory() cleanup) raises
+    PermissionError: [WinError 32]. Assert every connection _connect()
+    hands out is actually closed once its call site is done with it,
+    regardless of platform."""
+    import sqlite3
+
+    opened: list[sqlite3.Connection] = []
+    real_connect = store._connect
+
+    def spying_connect() -> sqlite3.Connection:
+        conn = real_connect()
+        opened.append(conn)
+        return conn
+
+    store._connect = spying_connect  # type: ignore[method-assign]
+
+    store.save("w1", {"step": 1}, platform="openai")
+    store.load("w1")
+    store.list_incomplete()
+    store.mark_done("w1")
+
+    assert len(opened) >= 4  # save, load, list_incomplete, mark_done each connect at least once
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")  # closed connections refuse any further use
